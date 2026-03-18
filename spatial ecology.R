@@ -591,3 +591,327 @@ dev.off()
 
 capture.output(sessionInfo(), file = file.path(out_dir, "sessionInfo.txt"))
 message("Week2 GLM with CV (800 m) completed. Outputs in: ", out_dir)
+
+set.seed(11)
+
+# make sure spatstat loads from user library
+user_lib <- file.path(Sys.getenv("USERPROFILE"), "Documents", "R", "win-library",
+                      paste0(R.version$major, ".", R.version$minor))
+dir.create(user_lib, recursive = TRUE, showWarnings = FALSE)
+.libPaths(c(user_lib, setdiff(.libPaths(), user_lib)))
+
+# load packages
+pkgs <- c("terra", "sf", "raster",
+          "spatstat.geom", "spatstat.model", "spatstat.explore")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install) > 0) install.packages(to_install, dependencies = TRUE)
+
+suppressPackageStartupMessages({
+  library(terra)
+  library(sf)
+  library(raster)
+  library(spatstat.geom)
+  library(spatstat.model)
+  library(spatstat.explore)
+})
+
+stopifnot(requireNamespace("spatstat.utils", quietly = TRUE))
+
+# file paths
+data_dir <- normalizePath("E:/spatial ecology", winslash = "/", mustWork = TRUE)
+out_dir  <- file.path(data_dir, "outputs_ppm_800m")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+dir.create(file.path(data_dir, "terra_tmp"), showWarnings = FALSE)
+terra::terraOptions(tempdir = file.path(data_dir, "terra_tmp"), memfrac = 0.6)
+
+lcm_file  <- file.path(data_dir, "LCMUK.tif")
+dem_file  <- file.path(data_dir, "demScotland.tif")
+occ_file  <- file.path(data_dir, "Melesmeles.csv")
+scot_file <- file.path(data_dir, "scotSamp.shp")
+
+stopifnot(file.exists(lcm_file), file.exists(dem_file),
+          file.exists(occ_file), file.exists(scot_file))
+
+# fixed radii
+radius_broadleaf <- 800
+radius_urban <- 2300
+
+# read study area
+scot <- sf::st_read(scot_file, quiet = TRUE)
+if (is.na(sf::st_crs(scot))) stop("scotSamp.shp has no CRS.")
+scot_ll <- sf::st_transform(scot, 4326)
+
+# read badger records
+meles <- read.csv(occ_file, stringsAsFactors = FALSE)
+
+meles$Longitude <- as.numeric(trimws(as.character(meles$Longitude)))
+meles$Latitude  <- as.numeric(trimws(as.character(meles$Latitude)))
+meles <- meles[!is.na(meles$Longitude) & !is.na(meles$Latitude), ]
+
+if ("Coordinate" %in% names(meles)) {
+  meles$Coordinate <- as.numeric(trimws(as.character(meles$Coordinate)))
+  meles <- meles[is.na(meles$Coordinate) | meles$Coordinate < 1000, ]
+}
+
+if ("Coordinate.uncertainty.in.metres" %in% names(meles)) {
+  meles$Coordinate.uncertainty.in.metres <-
+    as.numeric(trimws(as.character(meles$Coordinate.uncertainty.in.metres)))
+  meles <- meles[
+    is.na(meles$Coordinate.uncertainty.in.metres) |
+      meles$Coordinate.uncertainty.in.metres < 1000, ]
+}
+
+if ("Identification" %in% names(meles)) {
+  meles <- meles[is.na(meles$Identification) | meles$Identification != "Unconfirmed", ]
+}
+
+if ("Identification.verification.status" %in% names(meles)) {
+  meles <- meles[
+    is.na(meles$Identification.verification.status) |
+      tolower(trimws(meles$Identification.verification.status)) != "unconfirmed", ]
+}
+
+if (nrow(meles) == 0) stop("No badger records left after cleaning.")
+
+meles_ll <- sf::st_as_sf(meles, coords = c("Longitude", "Latitude"), crs = 4326)
+meles_ll <- suppressWarnings(sf::st_intersection(meles_ll, scot_ll))
+
+if (nrow(meles_ll) < 5) stop("Too few badger records inside scotSamp.shp.")
+
+# read rasters
+LCM <- terra::rast(lcm_file)
+if (terra::nlyr(LCM) > 1) LCM <- LCM[[1]]
+DEM <- terra::rast(dem_file)
+
+scot_proj  <- sf::st_transform(scot_ll, terra::crs(LCM))
+meles_proj <- sf::st_transform(meles_ll, terra::crs(LCM))
+
+LCM_crop <- terra::mask(
+  terra::crop(LCM, terra::vect(scot_proj)),
+  terra::vect(scot_proj)
+)
+
+DEM_crop <- terra::mask(
+  terra::crop(DEM, terra::vect(scot_proj)),
+  terra::vect(scot_proj)
+)
+
+# this version used class 1 for broadleaf
+LCM_fac <- terra::as.factor(LCM_crop)
+lv <- levels(LCM_fac)[[1]]
+codes <- lv[, 1]
+
+broadleaf <- terra::classify(
+  LCM_fac,
+  apply(cbind(codes, ifelse(codes == 1, 1, 0)), 2, as.numeric)
+)
+
+urb <- rep(0, length(codes))
+if (length(codes) >= 2) urb[(length(codes) - 1):length(codes)] <- 1
+
+urban <- terra::classify(
+  LCM_fac,
+  apply(cbind(codes, urb), 2, as.numeric)
+)
+
+# make circular weights
+makeWeights <- function(radius_m, template_rast) {
+  cell <- terra::res(template_rast)[1]
+  nPix <- round(radius_m / cell)
+  nPix <- (nPix * 2) + 1
+  wm <- matrix(1:nPix^2, nrow = nPix, ncol = nPix)
+  
+  cx <- ceiling(ncol(wm) / 2)
+  cy <- ceiling(nrow(wm) / 2)
+  focalCell <- wm[cx, cy]
+  indFocal <- which(wm == focalCell, arr.ind = TRUE)
+  
+  d <- vector("list", length = nPix^2)
+  for (i in 1:(nPix^2)) {
+    ind <- which(wm == i, arr.ind = TRUE)
+    dx <- abs(ind[1, 1] - indFocal[1, 1]) * cell
+    dy <- abs(ind[1, 2] - indFocal[1, 2]) * cell
+    d[[i]] <- sqrt(dx^2 + dy^2)
+  }
+  
+  wm[] <- unlist(d)
+  wm[wm > radius_m] <- NA
+  
+  wm_norm <- wm
+  wm_norm[!is.na(wm_norm)] <- 1 / length(wm_norm[!is.na(wm_norm)])
+  wm_norm
+}
+
+broadleaf_opt <- terra::focal(
+  broadleaf,
+  w = makeWeights(radius_broadleaf, broadleaf),
+  fun = "sum",
+  na.rm = TRUE
+)
+
+urban_2300 <- terra::focal(
+  urban,
+  w = makeWeights(radius_urban, broadleaf),
+  fun = "sum",
+  na.rm = TRUE
+)
+
+DEM_res <- terra::resample(DEM_crop, broadleaf_opt)
+
+env_stack <- c(broadleaf_opt, urban_2300, DEM_res)
+names(env_stack) <- c("broadleaf_opt", "urban_2300", "elev")
+
+env_stack <- terra::mask(
+  terra::crop(env_stack, terra::vect(scot_proj)),
+  terra::vect(scot_proj)
+)
+
+terra::writeRaster(
+  env_stack,
+  file.path(out_dir, "P1_covariates_stack.tif"),
+  overwrite = TRUE
+)
+
+# convert raster to spatstat image
+raster.as.im <- function(r) {
+  stopifnot(inherits(r, "Raster"))
+  ex <- raster::extent(r)
+  ncolr <- raster::ncol(r)
+  nrowr <- raster::nrow(r)
+  rx <- raster::xres(r)
+  ry <- raster::yres(r)
+  
+  xx <- seq(from = raster::xmin(ex) + rx / 2,
+            to   = raster::xmax(ex) - rx / 2,
+            length.out = ncolr)
+  yy <- seq(from = raster::ymin(ex) + ry / 2,
+            to   = raster::ymax(ex) - ry / 2,
+            length.out = nrowr)
+  
+  v <- raster::getValues(r)
+  mat <- matrix(v, nrow = nrowr, ncol = ncolr, byrow = TRUE)
+  mat <- mat[nrowr:1, , drop = FALSE]
+  
+  spatstat.geom::im(mat, xcol = xx, yrow = yy)
+}
+
+broadleafIm <- raster.as.im(raster::raster(env_stack[["broadleaf_opt"]]))
+urbanIm     <- raster.as.im(raster::raster(env_stack[["urban_2300"]]))
+elevIm      <- raster.as.im(raster::raster(env_stack[["elev"]]))
+
+# build analysis window
+valid_mask_r <- !is.na(raster::raster(env_stack[[1]]))
+valid_mask_im <- raster.as.im(valid_mask_r)
+W <- spatstat.geom::as.owin(valid_mask_im)
+
+# fill edge NA values
+broadleafIm$v[!is.finite(broadleafIm$v)] <- 0
+urbanIm$v[!is.finite(urbanIm$v)]         <- 0
+elev_fill <- median(elevIm$v[is.finite(elevIm$v)], na.rm = TRUE)
+elevIm$v[!is.finite(elevIm$v)] <- elev_fill
+
+# make ppp object
+xy <- sf::st_coordinates(meles_proj)
+pppMeles <- spatstat.geom::ppp(xy[, 1], xy[, 2], window = W)
+pppMeles <- spatstat.geom::as.ppp(pppMeles)
+pppMeles <- pppMeles[W]
+
+png(file.path(out_dir, "P2_ppp_qc.png"), width = 900, height = 650, res = 150)
+plot(pppMeles, main = "Badger ppp — QC")
+dev.off()
+
+# rescale to km
+pppMeles    <- spatstat.geom::rescale(pppMeles, 1000)
+broadleafIm <- spatstat.geom::rescale(broadleafIm, 1000)
+urbanIm     <- spatstat.geom::rescale(urbanIm, 1000)
+elevIm      <- spatstat.geom::rescale(elevIm, 1000)
+
+# tune quadrature density
+ndTry <- seq(100, 1000, by = 100)
+aic_tbl <- data.frame(nd = ndTry, AIC = NA_real_)
+
+for (i in seq_along(ndTry)) {
+  Q_i <- spatstat.geom::quadscheme(pppMeles, method = "grid", nd = ndTry[i])
+  fit_i <- spatstat.model::ppm(Q_i ~ broadleafIm + elevIm + urbanIm)
+  aic_tbl$AIC[i] <- AIC(fit_i)
+}
+
+write.csv(aic_tbl, file.path(out_dir, "P3_quadrature_AIC.csv"), row.names = FALSE)
+
+best_nd <- aic_tbl$nd[which.min(aic_tbl$AIC)]
+Q <- spatstat.geom::quadscheme(pppMeles, method = "grid", nd = best_nd)
+
+png(file.path(out_dir, "P4_quadrature_AIC_plot.png"), width = 900, height = 600, res = 150)
+plot(aic_tbl$nd, aic_tbl$AIC, type = "b", pch = 19,
+     xlab = "nd (grid quadrature)",
+     ylab = "AIC",
+     main = "Quadrature tuning by AIC")
+abline(v = best_nd, lty = 2)
+dev.off()
+
+# fit ppm
+ppm_fit <- spatstat.model::ppm(
+  Q ~ poly(broadleafIm, 3) + poly(elevIm, 2) + poly(urbanIm, 2) + x + y
+)
+
+capture.output(summary(ppm_fit), file = file.path(out_dir, "P5_ppm_summary.txt"))
+
+envK <- spatstat.explore::envelope(
+  ppm_fit, spatstat.explore::Kest,
+  nsim = 39, VARIANCE = TRUE, nSD = 1, global = TRUE
+)
+
+png(file.path(out_dir, "P6_ppm_Kest_envelope.png"), width = 900, height = 650, res = 150)
+plot(envK, main = "Kest envelope — ppm")
+dev.off()
+
+# fit Thomas kppm
+kppm_thomas <- spatstat.model::kppm(
+  Q ~ poly(broadleafIm, 3) + poly(elevIm, 2) + poly(urbanIm, 2) + x + y,
+  clusters = "Thomas"
+)
+
+capture.output(summary(kppm_thomas), file = file.path(out_dir, "P7_kppm_thomas_summary.txt"))
+
+envKinh <- spatstat.explore::envelope(
+  kppm_thomas, spatstat.explore::Kinhom,
+  nsim = 39, VARIANCE = TRUE, nSD = 1, global = TRUE
+)
+
+png(file.path(out_dir, "P8_kppm_Kinhom_envelope.png"), width = 900, height = 650, res = 150)
+plot(envKinh, main = "Kinhom envelope — Thomas kppm")
+dev.off()
+
+# ROC and intensity map
+roc_obj <- spatstat.explore::roc(kppm_thomas)
+auc_val <- spatstat.model::auc.kppm(kppm_thomas)
+
+write.csv(
+  data.frame(
+    AUC_obs = auc_val["obs"],
+    AUC_theo = auc_val["theo"]
+  ),
+  file.path(out_dir, "P9_auc_kppm.csv"),
+  row.names = FALSE
+)
+
+png(file.path(out_dir, "P10_ROC_curve.png"), width = 900, height = 650, res = 150)
+plot(roc_obj, main = "ROC — Thomas kppm")
+dev.off()
+
+pred_im <- predict(kppm_thomas)
+pred_rast <- terra::rast(pred_im)
+
+terra::writeRaster(
+  pred_rast,
+  file.path(out_dir, "P11_intensity_thomas.tif"),
+  overwrite = TRUE
+)
+
+png(file.path(out_dir, "P12_intensity_map.png"), width = 900, height = 650, res = 150)
+plot(pred_rast, main = "Predicted intensity — Thomas kppm")
+dev.off()
+
+capture.output(sessionInfo(), file = file.path(out_dir, "sessionInfo.txt"))
+message("DONE. Outputs in: ", out_dir)
